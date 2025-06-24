@@ -5,6 +5,7 @@ struct SettingsView: View {
     @AppStorage("wrap") private var wrapWorkspace: Bool = false
     @AppStorage("natrual") private var naturalSwipe: Bool = true
     @AppStorage("skip-empty") private var skipEmpty: Bool = false
+    @AppStorage("qwerty-flow") private var qwertyFlow: Bool = false
     @AppStorage("fingers") private var fingers: String = "Three"
 
     @State private var numberFormatter: NumberFormatter = {
@@ -69,6 +70,12 @@ struct SettingsView: View {
             VStack(alignment: .leading) {
                 Toggle("Skip Empty Workspace", isOn: $skipEmpty)
                 Text("Enable to skip empty workspaces").foregroundStyle(
+                    .secondary
+                )
+            }.padding(.vertical, 4)
+            VStack(alignment: .leading) {
+                Toggle("QWERTY flow swipe", isOn: $qwertyFlow)
+                Text("Enable swiping by QWERTY flow").foregroundStyle(
                     .secondary
                 )
             }.padding(.vertical, 4)

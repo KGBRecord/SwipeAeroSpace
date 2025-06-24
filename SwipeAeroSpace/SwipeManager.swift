@@ -84,6 +84,7 @@ class SwipeManager {
     @AppStorage("wrap") private var wrapWorkspace: Bool = false
     @AppStorage("natrual") private var naturalSwipe: Bool = true
     @AppStorage("skip-empty") private var skipEmpty: Bool = false
+    @AppStorage("qwerty-flow") private var qwertyFlow: Bool = false
     @AppStorage("fingers") private var fingers: String = "Three"
 
     var socketInfo = SocketInfo()
@@ -160,24 +161,91 @@ class SwipeManager {
         guard let mouse_on = try? res.get() else {
             return res
         }
-        res = runCommand(args: ["workspace", mouse_on], stdin: "")
+        
+        let currentWorkspace = mouse_on.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        
+        res = runCommand(args: ["workspace", currentWorkspace], stdin: "")
         guard (try? res.get()) != nil else {
             return res
         }
-
+        
         var args = ["workspace", direction.value]
         if wrapWorkspace {
             args.append("--wrap-around")
         }
         var stdin = ""
+        
+        var nonEmptyWorkspaces: Set<String> = []
         if skipEmpty {
             res = getNonEmptyWorkspaces()
             guard let ws = try? res.get() else {
                 return res
             }
             stdin = ws
+            nonEmptyWorkspaces = Set(ws.split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty })
         }
-        return runCommand(args: args, stdin: stdin)
+        
+        if !qwertyFlow {
+            return runCommand(args: args, stdin: stdin)
+        } else {
+            let qwertySequence = "123456789QWERTYUIOPASDFGHJKLZXCVBNM"
+            
+            guard let currentIndex = qwertySequence.firstIndex(where: { String($0) == currentWorkspace }) else {
+                return runCommand(args: args, stdin: stdin)
+            }
+            
+            let currentPosition = qwertySequence.distance(from: qwertySequence.startIndex, to: currentIndex)
+            
+            // Hàm tìm workspace tiếp theo (có thể bỏ qua empty workspace)
+            func findNextValidWorkspace(from position: Int, direction: Direction) -> Int? {
+                let totalCount = qwertySequence.count
+                var searchPosition = position
+                var attempts = 0
+                
+                while attempts < totalCount {
+                    switch direction {
+                    case .next:
+                        searchPosition += 1
+                        if wrapWorkspace && searchPosition >= totalCount {
+                            searchPosition = 0
+                        } else if searchPosition >= totalCount {
+                            return nil
+                        }
+                    case .prev:
+                        searchPosition -= 1
+                        if wrapWorkspace && searchPosition < 0 {
+                            searchPosition = totalCount - 1
+                        } else if searchPosition < 0 {
+                            return nil
+                        }
+                    default:
+                        return nil
+                    }
+                    
+                    let targetIndex = qwertySequence.index(qwertySequence.startIndex, offsetBy: searchPosition)
+                    let targetWorkspace = String(qwertySequence[targetIndex])
+                    
+                    if !skipEmpty || nonEmptyWorkspaces.contains(targetWorkspace) {
+                        return searchPosition
+                    }
+                    
+                    attempts += 1
+                }
+                
+                return nil
+            }
+            
+            guard let targetPosition = findNextValidWorkspace(from: currentPosition, direction: direction) else {
+                return .failure(.Unknown("No valid workspace found"))
+            }
+            
+            let targetIndex = qwertySequence.index(qwertySequence.startIndex, offsetBy: targetPosition)
+            let targetWorkspace = String(qwertySequence[targetIndex])
+            
+            return runCommand(args: ["workspace", targetWorkspace], stdin: stdin)
+        }
     }
 
     func nextWorkspace() {
