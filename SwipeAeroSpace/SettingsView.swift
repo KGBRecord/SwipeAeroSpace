@@ -5,7 +5,7 @@ struct SettingsView: View {
     @AppStorage("wrap") private var wrapWorkspace: Bool = false
     @AppStorage("natrual") private var naturalSwipe: Bool = true
     @AppStorage("skip-empty") private var skipEmpty: Bool = false
-    @AppStorage("qwerty-flow") private var qwertyFlow: Bool = false
+    @AppStorage("qwerty-flow") private var keyboardOrder: Bool = false
     @AppStorage("fingers") private var fingers: String = "Three"
 
     private static let numberFormatter: NumberFormatter = {
@@ -74,10 +74,9 @@ struct SettingsView: View {
                 )
             }.padding(.vertical, 4)
             VStack(alignment: .leading) {
-                Toggle("QWERTY flow swipe", isOn: $qwertyFlow)
-                Text("Enable swiping by QWERTY flow").foregroundStyle(
-                    .secondary
-                )
+                Toggle("Keyboard Order Swipe", isOn: $keyboardOrder)
+                Text("Swipe through workspaces in keyboard order")
+                    .foregroundStyle(.secondary)
             }.padding(.vertical, 4)
 
             LaunchAtLogin.Toggle {

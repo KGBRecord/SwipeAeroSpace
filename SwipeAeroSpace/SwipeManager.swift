@@ -1,7 +1,6 @@
 import Cocoa
 import Darwin
 import Foundation
-import SwiftUI
 import os
 
 enum Direction {
@@ -32,7 +31,22 @@ enum SwipeError: Error {
 private struct WorkspaceSwitchSettings {
     let wrapWorkspace: Bool
     let skipEmpty: Bool
-    let qwertyFlow: Bool
+    let keyboardOrder: Bool
+}
+
+private struct GestureSettings {
+    let swipeThreshold: Float
+    let naturalSwipe: Bool
+    let fingerCount: Int
+}
+
+private enum SettingKey {
+    static let threshold = "threshold"
+    static let wrap = "wrap"
+    static let natural = "natrual"
+    static let skipEmpty = "skip-empty"
+    static let keyboardOrder = "qwerty-flow"
+    static let fingers = "fingers"
 }
 
 public struct ClientRequest: Codable, Sendable {
@@ -70,7 +84,11 @@ public struct ServerAnswer: Codable, Sendable {
 }
 
 private final class AeroSpaceSocket {
-    private let bufferSize = 4096
+    private static let bufferSize = 4096
+    private var readBuffer = [UInt8](
+        repeating: 0,
+        count: AeroSpaceSocket.bufferSize
+    )
     private var descriptor: Int32
 
     init(path: String) throws {
@@ -126,6 +144,7 @@ private final class AeroSpaceSocket {
 
     func readResponse(using decoder: JSONDecoder) throws -> ServerAnswer {
         var responseData = Data()
+        responseData.reserveCapacity(Self.bufferSize)
 
         while true {
             try wait(for: Int16(POLLIN))
@@ -197,15 +216,13 @@ private final class AeroSpaceSocket {
     }
 
     private func readAvailable(into data: inout Data) throws {
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
-
         while true {
-            let count = buffer.withUnsafeMutableBytes {
+            let count = readBuffer.withUnsafeMutableBytes {
                 Darwin.read(descriptor, $0.baseAddress, $0.count)
             }
 
             if count > 0 {
-                data.append(buffer, count: count)
+                data.append(readBuffer, count: count)
             } else if count == 0 {
                 throw POSIXError(.ECONNRESET)
             } else if errno == EINTR {
@@ -223,25 +240,20 @@ private final class AeroSpaceSocket {
     }
 }
 
-class SocketInfo: ObservableObject {
+final class SocketInfo: ObservableObject {
     @Published var socketConnected: Bool = false
 }
 
-class SwipeManager {
-    // user settings
-    @AppStorage("threshold") private var swipeThreshold: Double = 0.3
-    @AppStorage("wrap") private var wrapWorkspace: Bool = false
-    @AppStorage("natrual") private var naturalSwipe: Bool = true
-    @AppStorage("skip-empty") private var skipEmpty: Bool = false
-    @AppStorage("qwerty-flow") private var qwertyFlow: Bool = false
-    @AppStorage("fingers") private var fingers: String = "Three"
-
+final class SwipeManager {
     var socketInfo = SocketInfo()
 
     private var eventTap: CFMachPort? = nil
     private var accDisX: Float = 0
     private var prevTouchPositions: [ObjectIdentifier: NSPoint] = [:]
     private var state: GestureState = .ended
+    private var gestureSettings = Self.readGestureSettings()
+    private var workspaceSwitchSettings = Self.readWorkspaceSwitchSettings()
+    private var settingsObserver: NSObjectProtocol? = nil
     private var socket: AeroSpaceSocket? = nil
     private let jsonEncoder = JSONEncoder()
     private let jsonDecoder = JSONDecoder()
@@ -251,14 +263,56 @@ class SwipeManager {
         qos: .userInitiated
     )
 
-    private static let qwertyFlowWorkspaces = Array(
+    private static let keyboardOrderedWorkspaces = Array(
         "123456789QWERTYUIOPASDFGHJKLZXCVBNM"
     ).map { String($0) }
-    private static let qwertyFlowWorkspacePositions = Dictionary(
-        uniqueKeysWithValues: qwertyFlowWorkspaces.enumerated().map {
+    private static let keyboardOrderedWorkspacePositions = Dictionary(
+        uniqueKeysWithValues: keyboardOrderedWorkspaces.enumerated().map {
             ($0.element, $0.offset)
         }
     )
+
+    private static func readGestureSettings() -> GestureSettings {
+        let defaults = UserDefaults.standard
+        let threshold =
+            defaults.object(forKey: SettingKey.threshold) as? Double ?? 0.3
+        let naturalSwipe = boolSetting(
+            SettingKey.natural,
+            defaultValue: true
+        )
+        let fingerCount =
+            defaults.string(forKey: SettingKey.fingers) == "Four" ? 4 : 3
+
+        return GestureSettings(
+            swipeThreshold: Float(threshold),
+            naturalSwipe: naturalSwipe,
+            fingerCount: fingerCount
+        )
+    }
+
+    private static func readWorkspaceSwitchSettings()
+        -> WorkspaceSwitchSettings
+    {
+        WorkspaceSwitchSettings(
+            wrapWorkspace: boolSetting(SettingKey.wrap, defaultValue: false),
+            skipEmpty: boolSetting(SettingKey.skipEmpty, defaultValue: false),
+            keyboardOrder: boolSetting(
+                SettingKey.keyboardOrder,
+                defaultValue: false
+            )
+        )
+    }
+
+    private static func boolSetting(
+        _ key: String,
+        defaultValue: Bool
+    ) -> Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: key) != nil else {
+            return defaultValue
+        }
+        return defaults.bool(forKey: key)
+    }
 
     private var logger: Logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,
@@ -267,6 +321,24 @@ class SwipeManager {
 
     init() {
         commandQueue.setSpecific(key: commandQueueKey, value: ())
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.reloadSettings()
+        }
+    }
+
+    deinit {
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
+        }
+    }
+
+    private func reloadSettings() {
+        gestureSettings = Self.readGestureSettings()
+        workspaceSwitchSettings = Self.readWorkspaceSwitchSettings()
     }
 
     private func runCommand(args: [String], stdin: String, retry: Bool = false)
@@ -353,14 +425,14 @@ class SwipeManager {
             )
         }
 
-        if !settings.qwertyFlow {
+        if !settings.keyboardOrder {
             return runCommand(args: args, stdin: stdin)
         } else {
-            let qwertyWorkspaces = Self.qwertyFlowWorkspaces
+            let orderedWorkspaces = Self.keyboardOrderedWorkspaces
 
             guard
                 let currentPosition =
-                    Self.qwertyFlowWorkspacePositions[currentWorkspace]
+                    Self.keyboardOrderedWorkspacePositions[currentWorkspace]
             else {
                 return runCommand(args: args, stdin: stdin)
             }
@@ -370,7 +442,7 @@ class SwipeManager {
                 from position: Int,
                 direction: Direction
             ) -> Int? {
-                let totalCount = qwertyWorkspaces.count
+                let totalCount = orderedWorkspaces.count
                 var searchPosition = position
                 var attempts = 0
 
@@ -394,7 +466,7 @@ class SwipeManager {
                         return nil
                     }
 
-                    let targetWorkspace = qwertyWorkspaces[searchPosition]
+                    let targetWorkspace = orderedWorkspaces[searchPosition]
 
                     if !settings.skipEmpty
                         || nonEmptyWorkspaces.contains(targetWorkspace)
@@ -417,7 +489,7 @@ class SwipeManager {
                 return .failure(.Unknown("No valid workspace found"))
             }
 
-            let targetWorkspace = qwertyWorkspaces[targetPosition]
+            let targetWorkspace = orderedWorkspaces[targetPosition]
 
             return runCommand(args: ["workspace", targetWorkspace], stdin: stdin)
         }
@@ -593,8 +665,7 @@ class SwipeManager {
     }
 
     private func processTouches(touches: Set<NSTouch>, count: Int) {
-        let finger_count = fingers == "Three" ? 3 : 4
-        if state != .began && count == finger_count {
+        if state != .began && count == gestureSettings.fingerCount {
             state = .began
         }
         if state == .began {
@@ -609,11 +680,11 @@ class SwipeManager {
 
     private func handleGesture() {
         // filter
-        if abs(accDisX) < Float(swipeThreshold) {
+        if abs(accDisX) < gestureSettings.swipeThreshold {
             return
         }
         let direction: Direction =
-            if naturalSwipe {
+            if gestureSettings.naturalSwipe {
                 accDisX < 0 ? .next : .prev
             } else {
                 accDisX < 0 ? .prev : .next
@@ -625,11 +696,7 @@ class SwipeManager {
     }
 
     private func currentWorkspaceSwitchSettings() -> WorkspaceSwitchSettings {
-        WorkspaceSwitchSettings(
-            wrapWorkspace: wrapWorkspace,
-            skipEmpty: skipEmpty,
-            qwertyFlow: qwertyFlow
-        )
+        workspaceSwitchSettings
     }
 
     private func horizontalSwipeDistance(touches: Set<NSTouch>) -> Float {

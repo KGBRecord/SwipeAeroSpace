@@ -1,6 +1,6 @@
 import Cocoa
 
-class PrivacyHelper {
+enum PrivacyHelper {
     static func isProcessTrustedWithPrompt() -> Bool {
         //TODO: Investigation required. Calling AXIsProcessTrustedWithOptions in sandboxed app doesn't prompt user (at least in Ventura 13.4.1) but creating CGEventTap does it.
         let isAccessibilityPermissionGranted = AXIsProcessTrustedWithOptions(

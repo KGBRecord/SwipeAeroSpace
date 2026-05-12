@@ -1,6 +1,6 @@
 import Cocoa
 
-class BundleInfo {
+enum BundleInfo {
     private static let infoDictionary = Bundle.main.infoDictionary ?? [:]
 
     private static func bundleInfo(_ key: String) -> String {
