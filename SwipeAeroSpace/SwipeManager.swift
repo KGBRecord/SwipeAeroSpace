@@ -1,6 +1,6 @@
 import Cocoa
+import Darwin
 import Foundation
-import Socket
 import SwiftUI
 import os
 
@@ -20,15 +20,19 @@ enum Direction {
 
 enum GestureState {
     case began
-    case changed
     case ended
-    case cancelled
 }
 
 enum SwipeError: Error {
     case SocketError(String)
     case CommandFail(String)
     case Unknown(String)
+}
+
+private struct WorkspaceSwitchSettings {
+    let wrapWorkspace: Bool
+    let skipEmpty: Bool
+    let qwertyFlow: Bool
 }
 
 public struct ClientRequest: Codable, Sendable {
@@ -65,17 +69,162 @@ public struct ServerAnswer: Codable, Sendable {
     }
 }
 
-class SocketInfo: ObservableObject {
-    @Published var socketConnected: Bool = false
-}
+private final class AeroSpaceSocket {
+    private let bufferSize = 4096
+    private var descriptor: Int32
 
-extension Result {
-    public var isSuccess: Bool {
-        switch self {
-        case .success: true
-        case .failure: false
+    init(path: String) throws {
+        descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw Self.posixError()
+        }
+
+        do {
+            try connect(path: path)
+            try setNonBlocking()
+        } catch {
+            close()
+            throw error
         }
     }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+    }
+
+    func write(_ data: Data) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var offset = 0
+
+            while offset < rawBuffer.count {
+                let count = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+
+                if count > 0 {
+                    offset += count
+                } else if errno == EINTR {
+                    continue
+                } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                    try wait(for: Int16(POLLOUT))
+                } else {
+                    throw Self.posixError()
+                }
+            }
+        }
+    }
+
+    func readResponse(using decoder: JSONDecoder) throws -> ServerAnswer {
+        var responseData = Data()
+
+        while true {
+            try wait(for: Int16(POLLIN))
+            try readAvailable(into: &responseData)
+
+            if let response = try? decoder.decode(
+                ServerAnswer.self,
+                from: responseData
+            ) {
+                return response
+            }
+        }
+    }
+
+    private func connect(path: String) throws {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+
+        let pathBytes = path.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path)
+        else {
+            throw POSIXError(.ENAMETOOLONG)
+        }
+
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: pathBytes.map { UInt8(bitPattern: $0) })
+        }
+
+        let addressLength = socklen_t(
+            MemoryLayout<sockaddr_un>.offset(of: \.sun_path)! + pathBytes.count
+        )
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, addressLength)
+            }
+        }
+
+        guard result == 0 else {
+            throw Self.posixError()
+        }
+    }
+
+    private func setNonBlocking() throws {
+        let flags = fcntl(descriptor, F_GETFL, 0)
+        guard flags >= 0 else {
+            throw Self.posixError()
+        }
+        guard fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            throw Self.posixError()
+        }
+    }
+
+    private func wait(for events: Int16) throws {
+        var fileDescriptor = pollfd(fd: descriptor, events: events, revents: 0)
+
+        while Darwin.poll(&fileDescriptor, 1, -1) < 0 {
+            if errno == EINTR {
+                continue
+            }
+            throw Self.posixError()
+        }
+
+        let failureEvents =
+            Int16(POLLERR) | Int16(POLLHUP) | Int16(POLLNVAL)
+        if fileDescriptor.revents & failureEvents != 0 {
+            throw POSIXError(.ECONNRESET)
+        }
+    }
+
+    private func readAvailable(into data: inout Data) throws {
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+
+            if count > 0 {
+                data.append(buffer, count: count)
+            } else if count == 0 {
+                throw POSIXError(.ECONNRESET)
+            } else if errno == EINTR {
+                continue
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            } else {
+                throw Self.posixError()
+            }
+        }
+    }
+
+    private static func posixError() -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
+class SocketInfo: ObservableObject {
+    @Published var socketConnected: Bool = false
 }
 
 class SwipeManager {
@@ -91,14 +240,34 @@ class SwipeManager {
 
     private var eventTap: CFMachPort? = nil
     private var accDisX: Float = 0
-    private var prevTouchPositions: [String: NSPoint] = [:]
+    private var prevTouchPositions: [ObjectIdentifier: NSPoint] = [:]
     private var state: GestureState = .ended
-    private var socket: Socket? = nil
+    private var socket: AeroSpaceSocket? = nil
+    private let jsonEncoder = JSONEncoder()
+    private let jsonDecoder = JSONDecoder()
+    private let commandQueueKey = DispatchSpecificKey<Void>()
+    private let commandQueue = DispatchQueue(
+        label: "club.mediosz.SwipeAeroSpace.commands",
+        qos: .userInitiated
+    )
+
+    private static let qwertyFlowWorkspaces = Array(
+        "123456789QWERTYUIOPASDFGHJKLZXCVBNM"
+    ).map { String($0) }
+    private static let qwertyFlowWorkspacePositions = Dictionary(
+        uniqueKeysWithValues: qwertyFlowWorkspaces.enumerated().map {
+            ($0.element, $0.offset)
+        }
+    )
 
     private var logger: Logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,
         category: "Info"
     )
+
+    init() {
+        commandQueue.setSpecific(key: commandQueueKey, value: ())
+    }
 
     private func runCommand(args: [String], stdin: String, retry: Bool = false)
         -> Result<String, SwipeError>
@@ -107,37 +276,23 @@ class SwipeManager {
             return .failure(.SocketError("No socket created"))
         }
         do {
-            let request = try JSONEncoder().encode(
+            let request = try jsonEncoder.encode(
                 ClientRequest(args: args, stdin: stdin)
             )
-            try socket.write(from: request)
-            let _ = try Socket.wait(
-                for: [socket],
-                timeout: 0,
-                waitForever: true
-            )
-            var answer = Data()
-            try socket.read(into: &answer)
-            let result = try JSONDecoder().decode(
-                ServerAnswer.self,
-                from: answer
-            )
+            try socket.write(request)
+            let result = try socket.readResponse(using: jsonDecoder)
             if result.exitCode != 0 {
                 return .failure(.CommandFail(result.stderr))
             }
             return .success(result.stdout)
 
         } catch let error {
-            guard let socketError = error as? Socket.Error else {
-                return .failure(.Unknown(error.localizedDescription))
-            }
-            // if we encouter the socket error
-            // try reconnect the socket and rerun the command only once.
+            // Reconnect once; the AeroSpace socket can disappear during restarts.
             if retry {
-                return .failure(.SocketError(socketError.localizedDescription))
+                return .failure(.SocketError(error.localizedDescription))
             }
             logger.info("Trying reconnect socket...")
-            connectSocket(reconnect: true)
+            connectSocketNow(reconnect: true)
             return runCommand(args: args, stdin: stdin, retry: true)
         }
     }
@@ -150,7 +305,10 @@ class SwipeManager {
     }
 
     @discardableResult
-    private func switchWorkspace(direction: Direction) -> Result<
+    private func switchWorkspace(
+        direction: Direction,
+        settings: WorkspaceSwitchSettings
+    ) -> Result<
         String, SwipeError
     > {
 
@@ -161,61 +319,73 @@ class SwipeManager {
         guard let mouse_on = try? res.get() else {
             return res
         }
-        
-        let currentWorkspace = mouse_on.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        
+
+        let currentWorkspace = mouse_on.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).uppercased()
+
         res = runCommand(args: ["workspace", currentWorkspace], stdin: "")
         guard (try? res.get()) != nil else {
             return res
         }
-        
+
         var args = ["workspace", direction.value]
-        if wrapWorkspace {
+        if settings.wrapWorkspace {
             args.append("--wrap-around")
         }
         var stdin = ""
-        
+
         var nonEmptyWorkspaces: Set<String> = []
-        if skipEmpty {
+        if settings.skipEmpty {
             res = getNonEmptyWorkspaces()
             guard let ws = try? res.get() else {
                 return res
             }
             stdin = ws
-            nonEmptyWorkspaces = Set(ws.split(separator: "\n")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
-                .filter { !$0.isEmpty })
+            nonEmptyWorkspaces = Set(
+                ws.split(separator: "\n")
+                    .map {
+                        $0.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).uppercased()
+                    }
+                    .filter { !$0.isEmpty }
+            )
         }
-        
-        if !qwertyFlow {
+
+        if !settings.qwertyFlow {
             return runCommand(args: args, stdin: stdin)
         } else {
-            let qwertySequence = "123456789QWERTYUIOPASDFGHJKLZXCVBNM"
-            
-            guard let currentIndex = qwertySequence.firstIndex(where: { String($0) == currentWorkspace }) else {
+            let qwertyWorkspaces = Self.qwertyFlowWorkspaces
+
+            guard
+                let currentPosition =
+                    Self.qwertyFlowWorkspacePositions[currentWorkspace]
+            else {
                 return runCommand(args: args, stdin: stdin)
             }
-            
-            let currentPosition = qwertySequence.distance(from: qwertySequence.startIndex, to: currentIndex)
-            
+
             // Hàm tìm workspace tiếp theo (có thể bỏ qua empty workspace)
-            func findNextValidWorkspace(from position: Int, direction: Direction) -> Int? {
-                let totalCount = qwertySequence.count
+            func findNextValidWorkspace(
+                from position: Int,
+                direction: Direction
+            ) -> Int? {
+                let totalCount = qwertyWorkspaces.count
                 var searchPosition = position
                 var attempts = 0
-                
+
                 while attempts < totalCount {
                     switch direction {
                     case .next:
                         searchPosition += 1
-                        if wrapWorkspace && searchPosition >= totalCount {
+                        if settings.wrapWorkspace && searchPosition >= totalCount {
                             searchPosition = 0
                         } else if searchPosition >= totalCount {
                             return nil
                         }
                     case .prev:
                         searchPosition -= 1
-                        if wrapWorkspace && searchPosition < 0 {
+                        if settings.wrapWorkspace && searchPosition < 0 {
                             searchPosition = totalCount - 1
                         } else if searchPosition < 0 {
                             return nil
@@ -223,64 +393,107 @@ class SwipeManager {
                     default:
                         return nil
                     }
-                    
-                    let targetIndex = qwertySequence.index(qwertySequence.startIndex, offsetBy: searchPosition)
-                    let targetWorkspace = String(qwertySequence[targetIndex])
-                    
-                    if !skipEmpty || nonEmptyWorkspaces.contains(targetWorkspace) {
+
+                    let targetWorkspace = qwertyWorkspaces[searchPosition]
+
+                    if !settings.skipEmpty
+                        || nonEmptyWorkspaces.contains(targetWorkspace)
+                    {
                         return searchPosition
                     }
-                    
+
                     attempts += 1
                 }
-                
+
                 return nil
             }
-            
-            guard let targetPosition = findNextValidWorkspace(from: currentPosition, direction: direction) else {
+
+            guard
+                let targetPosition = findNextValidWorkspace(
+                    from: currentPosition,
+                    direction: direction
+                )
+            else {
                 return .failure(.Unknown("No valid workspace found"))
             }
-            
-            let targetIndex = qwertySequence.index(qwertySequence.startIndex, offsetBy: targetPosition)
-            let targetWorkspace = String(qwertySequence[targetIndex])
-            
+
+            let targetWorkspace = qwertyWorkspaces[targetPosition]
+
             return runCommand(args: ["workspace", targetWorkspace], stdin: stdin)
         }
     }
 
     func nextWorkspace() {
-        switch switchWorkspace(direction: .next) {
-        case .success: return
-        case .failure(let err): logger.error("\(err.localizedDescription)")
-        }
+        switchWorkspaceAsync(
+            direction: .next,
+            settings: currentWorkspaceSwitchSettings()
+        )
     }
 
     func prevWorkspace() {
-        switch switchWorkspace(direction: .prev) {
-        case .success: return
-        case .failure(let err): logger.error("\(err.localizedDescription)")
-        }
+        switchWorkspaceAsync(
+            direction: .prev,
+            settings: currentWorkspaceSwitchSettings()
+        )
+    }
 
+    private func switchWorkspaceAsync(
+        direction: Direction,
+        settings: WorkspaceSwitchSettings
+    ) {
+        commandQueue.async { [weak self] in
+            guard let self else { return }
+            switch self.switchWorkspace(direction: direction, settings: settings) {
+            case .success: return
+            case .failure(let err): self.logger.error("\(err.localizedDescription)")
+            }
+        }
     }
 
     func connectSocket(reconnect: Bool = false) {
+        if DispatchQueue.getSpecific(key: commandQueueKey) != nil {
+            connectSocketNow(reconnect: reconnect)
+            return
+        }
+
+        commandQueue.async { [weak self] in
+            self?.connectSocketNow(reconnect: reconnect)
+        }
+    }
+
+    private func connectSocketNow(reconnect: Bool = false) {
         if socket != nil && !reconnect {
             logger.warning("socket is connected")
             return
         }
 
+        if reconnect {
+            socket?.close()
+            socket = nil
+            setSocketConnected(false)
+        }
+
         let socket_path = "/tmp/bobko.aerospace-\(NSUserName()).sock"
         do {
-            socket = try Socket.create(
-                family: .unix,
-                type: .stream,
-                proto: .unix
-            )
-            try socket?.connect(to: socket_path)
-            socketInfo.socketConnected = true
+            let connectedSocket = try AeroSpaceSocket(path: socket_path)
+            socket = connectedSocket
+            setSocketConnected(true)
             logger.info("connect to socket \(socket_path)")
         } catch let error {
+            socket?.close()
+            socket = nil
+            setSocketConnected(false)
             logger.error("Unexpected error: \(error.localizedDescription)")
+        }
+    }
+
+    private func setSocketConnected(_ isConnected: Bool) {
+        if Thread.isMainThread {
+            socketInfo.socketConnected = isConnected
+        } else {
+            DispatchQueue.main.async { [socketInfo] in
+                socketInfo.socketConnected = isConnected
+            }
         }
     }
 
@@ -293,7 +506,7 @@ class SwipeManager {
         eventTap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,
+            options: .listenOnly,
             eventsOfInterest: NSEvent.EventTypeMask.gesture.rawValue,
             callback: { proxy, type, cgEvent, me in
                 let wrapper = Unmanaged<SwipeManager>.fromOpaque(me!)
@@ -324,7 +537,17 @@ class SwipeManager {
 
     func stop() {
         logger.info("stop the app")
-        socket?.close()
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+            self.eventTap = nil
+        }
+        commandQueue.async { [weak self] in
+            guard let self else { return }
+            self.socket?.close()
+            self.socket = nil
+            self.setSocketConnected(false)
+        }
     }
 
     private func eventHandler(
@@ -395,10 +618,18 @@ class SwipeManager {
             } else {
                 accDisX < 0 ? .prev : .next
             }
-        switch switchWorkspace(direction: direction) {
-        case .success: return
-        case .failure(let err): logger.error("\(err.localizedDescription)")
-        }
+        switchWorkspaceAsync(
+            direction: direction,
+            settings: currentWorkspaceSwitchSettings()
+        )
+    }
+
+    private func currentWorkspaceSwitchSettings() -> WorkspaceSwitchSettings {
+        WorkspaceSwitchSettings(
+            wrapWorkspace: wrapWorkspace,
+            skipEmpty: skipEmpty,
+            qwertyFlow: qwertyFlow
+        )
     }
 
     private func horizontalSwipeDistance(touches: Set<NSTouch>) -> Float {
@@ -407,6 +638,7 @@ class SwipeManager {
         var sumDisX = Float(0)
         var sumDisY = Float(0)
         for touch in touches {
+            let touchKey = touchIdentityKey(touch)
             let (disX, disY) = touchDistance(touch)
             allRight = allRight && disX >= 0
             allLeft = allLeft && disX <= 0
@@ -414,10 +646,9 @@ class SwipeManager {
             sumDisY += disY
 
             if touch.phase == .ended {
-                prevTouchPositions.removeValue(forKey: "\(touch.identity)")
+                prevTouchPositions.removeValue(forKey: touchKey)
             } else {
-                prevTouchPositions["\(touch.identity)"] =
-                    touch.normalizedPosition
+                prevTouchPositions[touchKey] = touch.normalizedPosition
             }
         }
         // All fingers should move in the same direction.
@@ -434,7 +665,8 @@ class SwipeManager {
     }
 
     private func touchDistance(_ touch: NSTouch) -> (Float, Float) {
-        guard let prevPosition = prevTouchPositions["\(touch.identity)"] else {
+        guard let prevPosition = prevTouchPositions[touchIdentityKey(touch)]
+        else {
             return (0, 0)
         }
         let position = touch.normalizedPosition
@@ -442,5 +674,9 @@ class SwipeManager {
             Float(position.x - prevPosition.x),
             Float(position.y - prevPosition.y)
         )
+    }
+
+    private func touchIdentityKey(_ touch: NSTouch) -> ObjectIdentifier {
+        ObjectIdentifier(touch.identity as AnyObject)
     }
 }

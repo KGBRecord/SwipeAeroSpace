@@ -1,8 +1,10 @@
 import Cocoa
 
 class BundleInfo {
+    private static let infoDictionary = Bundle.main.infoDictionary ?? [:]
+
     private static func bundleInfo(_ key: String) -> String {
-        return Bundle.main.infoDictionary?[key] as? String ?? ""
+        return infoDictionary[key] as? String ?? ""
     }
 
     static func iconName() -> String {

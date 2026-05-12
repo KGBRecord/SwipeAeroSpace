@@ -19,7 +19,7 @@ class PrivacyHelper {
         _ = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,
+            options: .listenOnly,
             eventsOfInterest: NSEvent.EventTypeMask.gesture.rawValue,
             callback: dummyEventHandler,
             userInfo: nil

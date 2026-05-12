@@ -8,13 +8,13 @@ struct SettingsView: View {
     @AppStorage("qwerty-flow") private var qwertyFlow: Bool = false
     @AppStorage("fingers") private var fingers: String = "Three"
 
-    @State private var numberFormatter: NumberFormatter = {
+    private static let numberFormatter: NumberFormatter = {
         var nf = NumberFormatter()
         nf.numberStyle = .decimal
         return nf
     }()
 
-    let numbers = ["Three", "Four"]
+    private static let numbers = ["Three", "Four"]
 
     var swipeManager: SwipeManager
     @ObservedObject var socketInfo: SocketInfo
@@ -38,7 +38,7 @@ struct SettingsView: View {
                 TextField(
                     "Swipe Threshold",
                     value: SettingsView.$swipeThreshold,
-                    formatter: numberFormatter,
+                    formatter: Self.numberFormatter,
                     prompt: Text("0.3")
                 ).textFieldStyle(RoundedBorderTextFieldStyle()).frame(
                     maxWidth: 200
@@ -46,7 +46,7 @@ struct SettingsView: View {
             }
 
             Picker("Number of Fingers:", selection: $fingers) {
-                ForEach(numbers, id: \.self) {
+                ForEach(Self.numbers, id: \.self) {
                     Text($0)
                 }
             }
