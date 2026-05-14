@@ -251,8 +251,8 @@ final class SwipeManager {
     private var accDisX: Float = 0
     private var prevTouchPositions: [ObjectIdentifier: NSPoint] = [:]
     private var state: GestureState = .ended
-    private var gestureSettings = Self.readGestureSettings()
-    private var workspaceSwitchSettings = Self.readWorkspaceSwitchSettings()
+    private var gestureSettings = SwipeManager.readGestureSettings()
+    private var workspaceSwitchSettings = SwipeManager.readWorkspaceSwitchSettings()
     private var settingsObserver: NSObjectProtocol? = nil
     private var socket: AeroSpaceSocket? = nil
     private let jsonEncoder = JSONEncoder()
