@@ -665,6 +665,14 @@ final class SwipeManager {
     }
 
     private func processTouches(touches: Set<NSTouch>, count: Int) {
+        // If more fingers than configured are touching, this isn't our
+        // gesture. Cancel any in-progress tracking so e.g. a 4-finger swipe
+        // is not accepted while the setting is 3 fingers.
+        if count > gestureSettings.fingerCount {
+            state = .ended
+            clearEventState()
+            return
+        }
         if state != .began && count == gestureSettings.fingerCount {
             state = .began
         }
